@@ -46,6 +46,7 @@ int main(int argc, char* argv[]) {
   unsigned samples  = 500;
   std::string freeze_arg = "";
   bool covariance   = false;
+  bool sample_deviations = false;
   string data       = "data_obs";
   bool skip_prefit  = false;
   bool skip_proc_errs = false;
@@ -98,6 +99,9 @@ int main(int argc, char* argv[]) {
     ("covariance",
       po::value<bool>(&covariance)->default_value(covariance)->implicit_value(true),
       "Save the covariance and correlation matrices of the process yields")
+    ("sample-deviations",
+      po::value<bool>(&sample_deviations)->default_value(sample_deviations)->implicit_value(true),
+      "Save the per-sample per-bin deviations as <proc>_sampledev (TH2F, bin x sample).")
     ("skip-prefit",
       po::value<bool>(&skip_prefit)->default_value(skip_prefit)->implicit_value(true),
       "Skip the pre-fit evaluation")
@@ -315,6 +319,36 @@ int main(int argc, char* argv[]) {
 
     map<string, TH2F> post_shapes_tot;
 
+    // Per-sample, per-bin deviations, allows correlation-aware uncertainties for projections.
+    map<string, map<string, TH2F>> post_devs; // per channel
+    map<string, TH2F> post_devs_tot; // summed over channels
+
+    auto sampled_shape = [&](ch::CombineHarvester c, string const& bin,
+                             string const& name) -> TH2F {
+      if (!sample_deviations) return c.Get2DShapeWithUncertainty(res, samples);
+      TH2F dev;
+      TH2F h = c.Get2DShapeWithUncertainty(res, samples, &dev);
+      post_devs[bin][name] = dev;
+      return h;
+    };
+    auto sampled_shape_tot = [&](ch::CombineHarvester c,
+                                 string const& name) -> TH2F {
+      if (!sample_deviations) return c.Get2DShapeWithUncertainty(res, samples);
+      TH2F dev;
+      TH2F h = c.Get2DShapeWithUncertainty(res, samples, &dev);
+      post_devs_tot[name] = dev;
+      return h;
+    };
+    auto check_dev_binning = [&](TH2F const& h, TH2F const& dev,
+                                 string const& name) {
+      if (dev.GetNbinsX() != h.GetNbinsX() * h.GetNbinsY()) {
+        std::cout << ">> WARNING: " << name << "_sampledev has "
+                  << dev.GetNbinsX() << " bins but " << name << " has "
+                  << h.GetNbinsX() << "x" << h.GetNbinsY()
+                  << "; the flattened bin index no longer matches the shape\n";
+      }
+    };
+
     if(total_shapes){
       post_shapes_tot["data_obs"] = cmb.GetObserved2DShape();
       // Fill the total sig. and total bkg. hists
@@ -323,15 +357,15 @@ int main(int argc, char* argv[]) {
       std::cout << ">> Doing postfit: TotalBkg" << std::endl;
       post_shapes_tot["TotalBkg"] =
           no_sampling ? cmb_bkgs.Get2DShapeWithUncertainty()
-                   : cmb_bkgs.Get2DShapeWithUncertainty(res, samples);
+                   : sampled_shape_tot(cmb_bkgs, "TotalBkg");
       std::cout << ">> Doing postfit: TotalSig" << std::endl;
       post_shapes_tot["TotalSig"] =
           no_sampling ? cmb_sigs.Get2DShapeWithUncertainty()
-                   : cmb_sigs.Get2DShapeWithUncertainty(res, samples);
+                   : sampled_shape_tot(cmb_sigs, "TotalSig");
       std::cout << ">> Doing postfit: TotalProcs" << std::endl;
       post_shapes_tot["TotalProcs"] =
           no_sampling ? cmb.cp().Get2DShapeWithUncertainty()
-                   : cmb.cp().Get2DShapeWithUncertainty(res, samples);
+                   : sampled_shape_tot(cmb.cp(), "TotalProcs");
 
       if (datacard != "") {
         TH2F ref = cmb_card.cp().GetObserved2DShape();
@@ -345,6 +379,11 @@ int main(int argc, char* argv[]) {
       for (auto & iter : post_shapes_tot) {
         ch::WriteToTFile(&(iter.second), &outfile,
                          "postfit/" + iter.first);
+      }
+      for (auto & iter : post_devs_tot) {
+        check_dev_binning(post_shapes_tot[iter.first], iter.second, iter.first);
+        ch::WriteToTFile(&(iter.second), &outfile,
+                         "postfit/" + iter.first + "_sampledev");
       }
     }
 
@@ -362,7 +401,7 @@ int main(int argc, char* argv[]) {
         } else {
           post_shapes[bin][proc] =
               no_sampling ? cmb_proc.Get2DShapeWithUncertainty()
-                       : cmb_proc.Get2DShapeWithUncertainty(res, samples);
+                       : sampled_shape(cmb_proc, bin, proc);
         }
       }
       if (!no_sampling && covariance) {
@@ -375,15 +414,15 @@ int main(int argc, char* argv[]) {
       std::cout << ">> Doing postfit: " << bin << "," << "TotalBkg" << std::endl;
       post_shapes[bin]["TotalBkg"] =
           no_sampling ? cmb_bkgs.Get2DShapeWithUncertainty()
-                   : cmb_bkgs.Get2DShapeWithUncertainty(res, samples);
+                   : sampled_shape(cmb_bkgs, bin, "TotalBkg");
       std::cout << ">> Doing postfit: " << bin << "," << "TotalSig" << std::endl;
       post_shapes[bin]["TotalSig"] =
           no_sampling ? cmb_sigs.Get2DShapeWithUncertainty()
-                   : cmb_sigs.Get2DShapeWithUncertainty(res, samples);
+                   : sampled_shape(cmb_sigs, bin, "TotalSig");
       std::cout << ">> Doing postfit: " << bin << "," << "TotalProcs" << std::endl;
       post_shapes[bin]["TotalProcs"] =
           no_sampling ? cmb_bin.cp().Get2DShapeWithUncertainty()
-                   : cmb_bin.cp().Get2DShapeWithUncertainty(res, samples);
+                   : sampled_shape(cmb_bin.cp(), bin, "TotalProcs");
 
       if (datacard != "") {
         TH2F ref = cmb_card.cp().bin({bin}).GetObserved2DShape();
@@ -398,6 +437,11 @@ int main(int argc, char* argv[]) {
       for (auto const& rbin : reverse_bins_) {
         if (rbin != bin) continue;
         std::cout << ">> reversing hists in bin " << bin << "\n";
+        if (sample_deviations && post_devs.count(bin)) {
+          std::cout << ">> WARNING: --reverse-bins is not applied to the "
+                       "_sampledev histograms; their flattened bin index "
+                       "refers to the original, unreversed ordering\n";
+        }
         auto & hists = post_shapes[bin];
         for (auto it = hists.begin(); it != hists.end(); ++it) {
           ReverseBins(it->second);
@@ -407,6 +451,12 @@ int main(int argc, char* argv[]) {
       for (auto & iter : post_shapes[bin]) {
         ch::WriteToTFile(&(iter.second), &outfile,
                          bin + "_postfit/" + iter.first);
+      }
+      for (auto & iter : post_devs[bin]) {
+        check_dev_binning(post_shapes[bin][iter.first], iter.second,
+                          iter.first);
+        ch::WriteToTFile(&(iter.second), &outfile,
+                         bin + "_postfit/" + iter.first + "_sampledev");
       }
       for (auto & iter : post_yield_cov) {
         ch::WriteToTFile(&(iter.second), &outfile,
