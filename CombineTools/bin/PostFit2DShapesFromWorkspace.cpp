@@ -3,6 +3,7 @@
 #include "boost/format.hpp"
 #include "TSystem.h"
 #include "TH2F.h"
+#include "RooRandom.h"
 #include "CombineHarvester/CombineTools/interface/CombineHarvester.h"
 #include "CombineHarvester/CombineTools/interface/ParseCombineWorkspace.h"
 #include "CombineHarvester/CombineTools/interface/TFileIO.h"
@@ -133,6 +134,13 @@ int main(int argc, char* argv[]) {
 
   if (sampling) {
     std::cout<<"WARNING: the default behaviour of PostFitShapesFromWorkspace is to use the covariance matrix sampling method for the post-fit uncertainty. The option --sampling is deprecated and will be removed in future versions of CombineHarvester"<<std::endl;
+  }
+
+  if (sample_deviations && !reverse_bins_.empty()) {
+    std::cerr << "ERROR: --sample-deviations cannot be combined with "
+                 "--reverse-bins: the deviations are indexed by the original "
+                 "bin ordering, which --reverse-bins invalidates\n";
+    return 1;
   }
 
   TFile infile(workspace.c_str());
@@ -323,8 +331,14 @@ int main(int argc, char* argv[]) {
     map<string, map<string, TH2F>> post_devs; // per channel
     map<string, TH2F> post_devs_tot; // summed over channels
 
+    // Each Get2DShapeWithUncertainty call draws its own toys. Reseeding first
+    // makes every shape see the same toys, so that the deviations (and the
+    // errors) of different shapes correspond toy by toy and can be combined
+    // TotalProcs then equals the sum of its processes exactly.
+    const UInt_t toy_seed = 20260909;
     auto sampled_shape = [&](ch::CombineHarvester c, string const& bin,
                              string const& name) -> TH2F {
+      RooRandom::randomGenerator()->SetSeed(toy_seed);
       if (!sample_deviations) return c.Get2DShapeWithUncertainty(res, samples);
       TH2F dev;
       TH2F h = c.Get2DShapeWithUncertainty(res, samples, &dev);
@@ -333,6 +347,7 @@ int main(int argc, char* argv[]) {
     };
     auto sampled_shape_tot = [&](ch::CombineHarvester c,
                                  string const& name) -> TH2F {
+      RooRandom::randomGenerator()->SetSeed(toy_seed);
       if (!sample_deviations) return c.Get2DShapeWithUncertainty(res, samples);
       TH2F dev;
       TH2F h = c.Get2DShapeWithUncertainty(res, samples, &dev);
@@ -437,11 +452,6 @@ int main(int argc, char* argv[]) {
       for (auto const& rbin : reverse_bins_) {
         if (rbin != bin) continue;
         std::cout << ">> reversing hists in bin " << bin << "\n";
-        if (sample_deviations && post_devs.count(bin)) {
-          std::cout << ">> WARNING: --reverse-bins is not applied to the "
-                       "_sampledev histograms; their flattened bin index "
-                       "refers to the original, unreversed ordering\n";
-        }
         auto & hists = post_shapes[bin];
         for (auto it = hists.begin(); it != hists.end(); ++it) {
           ReverseBins(it->second);
